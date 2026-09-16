@@ -356,9 +356,16 @@ export default function App() {
     }
     
     const totalBaseCost = baseCost + safetyCost;
-    const margin = margins.find(m => totalBaseCost >= parseFloat(m.minCost) && totalBaseCost <= parseFloat(m.maxCost));
+    
+    // Kar Marjı Kuralı (Üretim maliyetine göre Kuralı buluyoruz)
+    const margin = margins.find(m => prodCost >= parseFloat(m.minCost) && prodCost <= parseFloat(m.maxCost));
     const multiplier = margin ? parseFloat(margin.multiplier) : 1; 
-    const salePrice = totalBaseCost * multiplier;
+    
+    // SADECE PLASTİK MALİYETİ ÜZERİNDEN KÂR (ÇARPAN) UYGULANIYOR
+    const profitOnProduction = prodCost * multiplier; 
+    
+    // Satış Fiyatı: (Üretim x Çarpan) + (Diğer tüm sabit maliyetler çıplak halde)
+    const salePrice = profitOnProduction + boxCost + shippingCost + packingCost + safetyCost;
 
     const taxRate = parseFloat(totalTaxPercent) / 100;
     const totalTaxCost = salePrice * taxRate;
