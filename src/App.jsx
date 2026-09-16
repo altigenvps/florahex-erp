@@ -230,14 +230,21 @@ export default function App() {
     setNewComm(initialCommState); setEditingCommId(null);
   };
 
-  // Vergiler
-  const initialTaxState = { name: '', rate: '' };
+  // Vergiler (YENİ MANTIK: KDV mi yoksa Gelir Vergisi mi?)
+  const initialTaxState = { name: '', rate: '', isIncomeTax: false };
   const [newTax, setNewTax] = useState(initialTaxState);
   const [editingTaxId, setEditingTaxId] = useState(null);
-  const totalTaxPercent = useMemo(() => taxes.reduce((sum, item) => sum + parseFloat(item.rate || 0), 0).toFixed(1), [taxes]);
+  
+  // Sadece KDV olanların toplamı (Cirodan Düşülecek)
+  const totalVATPercent = useMemo(() => taxes.filter(t => !t.isIncomeTax).reduce((sum, item) => sum + parseFloat(item.rate || 0), 0).toFixed(1), [taxes]);
+  
+  // Sadece Gelir Vergisi olanların toplamı (Kârdan Düşülecek)
+  const totalIncomeTaxPercent = useMemo(() => taxes.filter(t => t.isIncomeTax).reduce((sum, item) => sum + parseFloat(item.rate || 0), 0).toFixed(1), [taxes]);
+
   const saveTax = async () => {
     if(!newTax.name) return;
-    await saveToDb('taxes', newTax, editingTaxId);
+    // Veritabanına kaydederken isIncomeTax boolean'ını da gönderiyoruz
+    await saveToDb('taxes', { ...newTax, isIncomeTax: Boolean(newTax.isIncomeTax) }, editingTaxId);
     setNewTax(initialTaxState); setEditingTaxId(null);
   };
 
@@ -311,7 +318,7 @@ export default function App() {
 
   const [expandedSetId, setExpandedSetId] = useState(null);
 
-  // KARLILIK MOTORU
+  // KARLILIK MOTORU (GÜNCELLENMİŞ GERÇEKÇİ HESAPLAMA)
   const calculateSalesData = (set) => {
     const prodCost = parseFloat(set.totals.cost);
     let totalVolume = 0;
@@ -364,26 +371,41 @@ export default function App() {
     // SADECE PLASTİK MALİYETİ ÜZERİNDEN KÂR (ÇARPAN) UYGULANIYOR
     const profitOnProduction = prodCost * multiplier; 
     
-    // Satış Fiyatı: (Üretim x Çarpan) + (Diğer tüm sabit maliyetler çıplak halde)
+    // Satış Fiyatı (KDV Dahil Hedef Fiyat): (Üretim x Çarpan) + Diğer Maliyetler
     const salePrice = profitOnProduction + boxCost + shippingCost + packingCost + safetyCost;
 
-    const taxRate = parseFloat(totalTaxPercent) / 100;
-    const totalTaxCost = salePrice * taxRate;
+    // 1. KDV HESAPLAMASI (KDV Dahil fiyattan KDV tutarını içten ayırma)
+    const vatRate = parseFloat(totalVATPercent) / 100;
+    // Formül: KDV Tutarı = Satış Fiyatı - (Satış Fiyatı / (1 + KDV Oranı))
+    // Örnek: 120 TL'nin KDV'si (%20): 120 - (120 / 1.20) = 20 TL
+    const vatCost = salePrice - (salePrice / (1 + vatRate));
+    
+    // KDV Hariç Satış Fiyatı (Gerçek Cironuz)
+    const salePriceWithoutVAT = salePrice - vatCost;
 
+    // 2. KOMİSYON HESAPLAMASI (Komisyon genellikle KDV Dahil satış fiyatı üzerinden kesilir)
     const commRate = parseFloat(totalCommissionPercent) / 100;
     const totalCommCost = (salePrice * commRate) + parseFloat(totalFixedFee);
 
-    const netProfit = salePrice - totalBaseCost - totalTaxCost - totalCommCost;
+    // 3. BRÜT KÂR HESAPLAMASI (Gerçek Ciro - Tüm Maliyetler - Komisyon)
+    const grossProfit = salePriceWithoutVAT - totalBaseCost - totalCommCost;
+
+    // 4. GELİR / KURUMLAR VERGİSİ HESAPLAMASI (Sadece Brüt Kâr pozitifse kesilir)
+    const incomeTaxRate = parseFloat(totalIncomeTaxPercent) / 100;
+    const incomeTaxCost = grossProfit > 0 ? (grossProfit * incomeTaxRate) : 0;
+
+    // 5. NET KÂR
+    const netProfit = grossProfit - incomeTaxCost;
     const profitMargin = salePrice > 0 ? (netProfit / salePrice) * 100 : 0;
 
     return {
         prodCost, selectedBox, boxCost, boxDesi, shippingInfo, shippingCost, packing, packingCost,
-        safetyCost, totalBaseCost, multiplier, salePrice, totalTaxCost, totalCommCost, netProfit, profitMargin
+        safetyCost, totalBaseCost, multiplier, salePrice, vatCost, incomeTaxCost, totalCommCost, grossProfit, netProfit, profitMargin
     };
   };
 
   const exportToExcel = () => {
-    const headers = ["SKU / Set Kodu", "Satış Fiyatı (TL)", "Üretim Maliyeti (TL)", "Koli Maliyeti (TL)", "Kargo Maliyeti (TL)", "Ambalaj (TL)", "Vergi (TL)", "Komisyon (TL)", "Net Kar (TL)", "Kar Marjı (%)", "Koli Tipi", "Kargo Desi", "Set İçeriği"];
+    const headers = ["SKU / Set Kodu", "Satış Fiyatı (TL)", "Üretim Maliyeti (TL)", "Koli Maliyeti (TL)", "Kargo Maliyeti (TL)", "Ambalaj (TL)", "KDV (TL)", "Gelir Vergisi (TL)", "Komisyon (TL)", "Net Kar (TL)", "Kar Marjı (%)", "Koli Tipi", "Kargo Desi", "Set İçeriği"];
     const rows = sets.map(set => {
       const data = calculateSalesData(set);
       const contentStr = set.modules.map(sm => {
@@ -391,7 +413,7 @@ export default function App() {
          return mod ? `${mod.name} (x${sm.qty})` : '';
       }).filter(Boolean).join(" + ");
       const formatNum = (num) => parseFloat(num).toFixed(2).replace('.', ',');
-      return [ set.name, formatNum(data.salePrice), formatNum(data.prodCost), formatNum(data.boxCost), formatNum(data.shippingCost), formatNum(data.packingCost), formatNum(data.totalTaxCost), formatNum(data.totalCommCost), formatNum(data.netProfit), formatNum(data.profitMargin), data.selectedBox ? data.selectedBox.name : "Koli Bulunamadı", formatNum(data.boxDesi), contentStr ];
+      return [ set.name, formatNum(data.salePrice), formatNum(data.prodCost), formatNum(data.boxCost), formatNum(data.shippingCost), formatNum(data.packingCost), formatNum(data.vatCost), formatNum(data.incomeTaxCost), formatNum(data.totalCommCost), formatNum(data.netProfit), formatNum(data.profitMargin), data.selectedBox ? data.selectedBox.name : "Koli Bulunamadı", formatNum(data.boxDesi), contentStr ];
     });
     const csvContent = [headers.join(";"), ...rows.map(row => row.join(";"))].join("\n");
     const blob = new Blob(["\uFEFF" + csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -778,26 +800,48 @@ export default function App() {
           <div className="space-y-6">
             <div className="flex justify-between items-center">
                <h2 className="text-xl font-semibold text-gray-800 flex items-center gap-2"><Calculator className="text-emerald-600" /> Vergi Yönetimi</h2>
-               <div className="bg-red-50 text-red-700 px-4 py-2 rounded-lg font-semibold shadow-sm border border-red-100">
-                  Toplam Vergi Yükü: %{totalTaxPercent}
+               <div className="flex gap-4">
+                 <div className="bg-red-50 text-red-700 px-4 py-2 rounded-lg font-semibold shadow-sm border border-red-100">
+                    Toplam KDV Yükü: %{totalVATPercent}
+                 </div>
+                 <div className="bg-orange-50 text-orange-700 px-4 py-2 rounded-lg font-semibold shadow-sm border border-orange-100">
+                    Toplam Gelir Vergisi: %{totalIncomeTaxPercent}
+                 </div>
                </div>
             </div>
              <div className={`p-5 rounded-xl shadow-sm border ${editingTaxId ? 'bg-amber-50 border-amber-200' : 'bg-white border-gray-200'}`}>
               <div className="flex justify-between items-center mb-4"><h3 className="font-semibold text-sm">{editingTaxId ? 'Vergiyi Düzenle' : 'Yeni Vergi Ekle'}</h3>{editingTaxId && <button onClick={() => {setEditingTaxId(null); setNewTax(initialTaxState)}} className="text-xs text-gray-500 flex items-center gap-1"><X size={14}/> İptal</button>}</div>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-4 items-end">
                 <div className="md:col-span-2"><label className="block text-xs mb-1">Vergi Adı</label><input type="text" value={newTax.name} onChange={e=>setNewTax({...newTax, name: e.target.value})} className="w-full p-2 border rounded text-sm"/></div>
                 <div><label className="block text-xs mb-1">Vergi Oranı (%)</label><input type="number" step="0.1" value={newTax.rate} onChange={e=>setNewTax({...newTax, rate: e.target.value})} className="w-full p-2 border rounded text-sm"/></div>
+                <div>
+                   <label className="block text-xs mb-1">Vergi Türü</label>
+                   <select 
+                     value={newTax.isIncomeTax ? 'true' : 'false'} 
+                     onChange={e=>setNewTax({...newTax, isIncomeTax: e.target.value === 'true'})} 
+                     className="w-full p-2 border rounded text-sm bg-white"
+                   >
+                     <option value="false">KDV (Satış Fiyatından Düşer)</option>
+                     <option value="true">Gelir/Kurumlar Vergisi (Net Kârdan Düşer)</option>
+                   </select>
+                </div>
                 <div><button onClick={saveTax} className="w-full bg-slate-800 hover:bg-slate-900 text-white p-2 rounded text-sm font-medium">{editingTaxId ? 'Güncelle' : 'Ekle'}</button></div>
               </div>
             </div>
             <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
                <table className="w-full text-left text-sm">
-                  <thead className="bg-gray-50 border-b text-gray-600"><tr><th className="p-4">Vergi Adı</th><th className="p-4">Oran</th><th className="p-4 text-center">İşlem</th></tr></thead>
+                  <thead className="bg-gray-50 border-b text-gray-600"><tr><th className="p-4">Vergi Adı</th><th className="p-4">Tür</th><th className="p-4">Oran</th><th className="p-4 text-center">İşlem</th></tr></thead>
                   <tbody className="divide-y">
                     {taxes.map(t => (
                       <tr key={t.id} className="hover:bg-gray-50">
                         <td className="p-4 font-medium">{t.name}</td>
-                        <td className="p-4 font-bold text-red-500">% {t.rate}</td>
+                        <td className="p-4 text-xs">
+                          {t.isIncomeTax ? 
+                            <span className="bg-orange-100 text-orange-800 px-2 py-1 rounded">Gelir Vergisi (Kârdan Düşer)</span> : 
+                            <span className="bg-red-100 text-red-800 px-2 py-1 rounded">KDV (Fiyattan İç Yüzdeyle Düşer)</span>
+                          }
+                        </td>
+                        <td className="p-4 font-bold text-gray-800">% {t.rate}</td>
                         <td className="p-4 text-center">
                           <button onClick={()=> {setNewTax(t); setEditingTaxId(t.id);}} className="text-gray-400 hover:text-amber-500 p-1 mr-2"><Edit size={16}/></button>
                           <button onClick={()=> deleteFromDb('taxes', t.id)} className="text-gray-400 hover:text-red-500 p-1"><Trash2 size={16}/></button>
@@ -1004,9 +1048,13 @@ export default function App() {
                               <div className="space-y-4 lg:border-l lg:pl-8 border-gray-200">
                                 <h4 className="font-semibold text-gray-700 border-b pb-2 text-sm uppercase">2. Finansal Özet</h4>
                                 <div className="space-y-2 text-sm">
-                                  <div className="flex justify-between"><span className="text-gray-600">Satış Fiyatı (Brüt)</span><span className="font-bold text-gray-900">{data.salePrice.toFixed(2)} ₺</span></div>
-                                  <div className="flex justify-between text-red-500"><span className="">- Vergi Kesintisi (%{totalTaxPercent})</span><span className="font-medium">-{data.totalTaxCost.toFixed(2)} ₺</span></div>
+                                  <div className="flex justify-between"><span className="text-gray-600">Satış Fiyatı (KDV Dahil)</span><span className="font-bold text-gray-900">{data.salePrice.toFixed(2)} ₺</span></div>
+                                  <div className="flex justify-between text-red-500"><span className="">- KDV Kesintisi (%{totalVATPercent})</span><span className="font-medium">-{data.vatCost.toFixed(2)} ₺</span></div>
                                   <div className="flex justify-between text-red-500"><span className="">- Komisyonlar (%{totalCommissionPercent})</span><span className="font-medium">-{data.totalCommCost.toFixed(2)} ₺</span></div>
+                                  <div className="flex justify-between border-t pt-2 mt-2 font-medium text-gray-700">
+                                    <span>Brüt Kâr</span><span>{data.grossProfit.toFixed(2)} ₺</span>
+                                  </div>
+                                  <div className="flex justify-between text-orange-500"><span className="">- Gelir/Kurumlar Vergisi (%{totalIncomeTaxPercent})</span><span className="font-medium">-{data.incomeTaxCost.toFixed(2)} ₺</span></div>
                                 </div>
                                 <div className="pt-2 border-t mt-4">
                                   <div className="bg-emerald-900 text-white p-4 rounded-lg flex justify-between items-center shadow-inner">
