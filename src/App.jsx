@@ -25,7 +25,6 @@ const userFirebaseConfig = {
   appId: "1:408045088937:web:e5b310ed3511df00b1f9b8"
 };
 
-// Sistemin kendi test veritabanını EZİP, SADECE sizin veritabanınızı kullanmaya zorluyoruz:
 const firebaseConfig = userFirebaseConfig; 
 const appId = 'florahex-erp';
 
@@ -103,7 +102,7 @@ export default function App() {
   const handleLogout = async () => {
     try {
       await signOut(auth);
-      setIsDbReady(false); // Veritabanı bağlantısını kes
+      setIsDbReady(false); 
     } catch (error) {
       console.error("Çıkış yapılırken hata oluştu:", error);
     }
@@ -147,8 +146,18 @@ export default function App() {
 
   const saveToDb = async (collectionName, data, id = null) => {
     if (!user) return;
-    const docId = id ? id.toString() : Date.now().toString();
-    await setDoc(doc(db, `${getBasePath()}/${collectionName}`, docId), data);
+    try {
+       if(id) {
+           await setDoc(doc(db, `${getBasePath()}/${collectionName}`, id.toString()), data);
+       } else {
+           // Firestore will auto-generate a valid 20-char ID if we use doc(collection(...))
+           // However, to keep it simple and consistent with your structure, we'll use a reliable timestamp string.
+           const newId = `doc_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+           await setDoc(doc(db, `${getBasePath()}/${collectionName}`, newId), data);
+       }
+    } catch (e) {
+        console.error("Error saving document: ", e);
+    }
   };
 
   const deleteFromDb = async (collectionName, id) => {
@@ -230,7 +239,7 @@ export default function App() {
     setNewComm(initialCommState); setEditingCommId(null);
   };
 
-  // Vergiler (YENİ MANTIK: KDV mi yoksa Gelir Vergisi mi?)
+  // Vergiler
   const initialTaxState = { name: '', rate: '', isIncomeTax: false };
   const [newTax, setNewTax] = useState(initialTaxState);
   const [editingTaxId, setEditingTaxId] = useState(null);
@@ -243,7 +252,6 @@ export default function App() {
 
   const saveTax = async () => {
     if(!newTax.name) return;
-    // Veritabanına kaydederken isIncomeTax boolean'ını da gönderiyoruz
     await saveToDb('taxes', { ...newTax, isIncomeTax: Boolean(newTax.isIncomeTax) }, editingTaxId);
     setNewTax(initialTaxState); setEditingTaxId(null);
   };
@@ -274,21 +282,38 @@ export default function App() {
   const [editingSetId, setEditingSetId] = useState(null);
   const [currentModuleSelection, setCurrentModuleSelection] = useState({ moduleId: '', qty: 1 });
 
+  // YENİ VE HATASIZ SKU OLUŞTURUCU (KATEGORİ İÇİNDE KULLANICININ EKLEME SIRASINI KORUR)
   const generateSetName = (selectedMods, existingId) => {
     if (selectedMods.length === 0) return "S_XXX_FH_...";
-    const setNumber = existingId ? existingId.substring(existingId.length - 3) : String(sets.length + 1).padStart(3, '0');
+    
+    // Güvenilir bir Set Numarası bul (Mevcut setId'den veya dizinin uzunluğundan)
+    // Random ID'lerin (doc_timestamp_random) uzunluk sorununu aşmak için "setNumber" hesaplıyoruz
+    let setNumber = "001";
+    if (existingId && existingId.startsWith('SET_')) {
+        setNumber = existingId.replace('SET_', '').substring(0, 3).padStart(3, '0');
+    } else {
+        setNumber = String(sets.length + 1).padStart(3, '0');
+    }
+
     let nameParts = [`S_${setNumber}`, 'FH'];
     
-    // selectedMods (kullanıcının eklediği sıra) dizisini kullanarak ilerliyoruz.
+    // Modülleri kategori sırasına göre grupla ama aynı kategori içinde EKLEME SIRASINI bozma.
     CATEGORIES.forEach(cat => {
-      // SADECE kategori eşleşmesini filtreliyoruz, SORT YAPMIYORUZ!
-      const modsInCat = selectedMods
-        .map(sm => ({ qty: sm.qty, mod: modules.find(m => m.id === sm.moduleId) }))
-        .filter(item => item.mod && item.mod.category === cat);
-        
-      // Eklenme sırasına göre koda ekliyoruz.
-      modsInCat.forEach(item => nameParts.push(`${item.mod.code.replace(/-/g, '_')}-${item.qty}`));
+      // 1. Sadece kullanıcının seçtiği array üzerinde filtreleme yapıyoruz. Sort yok.
+      const modsInCat = selectedMods.filter(sm => {
+         const mod = modules.find(m => m.id === sm.moduleId);
+         return mod && mod.category === cat;
+      });
+
+      // 2. Kategori eşleşenleri, eklenme sırasıyla SKU'ya ekle
+      modsInCat.forEach(sm => {
+         const mod = modules.find(m => m.id === sm.moduleId);
+         // "mod.code" içindeki tireleri (eğer varsa) alt çizgiye çevirerek SKU standardına uydur.
+         const cleanCode = mod.code.replaceAll('-', '_');
+         nameParts.push(`${cleanCode}-${sm.qty}`);
+      });
     });
+    
     return nameParts.join('_');
   };
 
@@ -316,8 +341,12 @@ export default function App() {
 
   const saveSet = async () => {
     if (newSet.selectedModules.length === 0) return;
-    const setId = editingSetId || `SET_${Date.now()}`;
-    const setData = { name: generateSetName(newSet.selectedModules, editingSetId ? setId : null), image: newSet.image, modules: newSet.selectedModules, totals: newSetTotals };
+    
+    // Set'ler için özel ID oluşturuyoruz ki numaralandırma düzgün çalışsın
+    const setId = editingSetId || `SET_${String(sets.length + 1).padStart(3, '0')}_${Date.now().toString().slice(-4)}`;
+    const finalName = generateSetName(newSet.selectedModules, editingSetId ? editingSetId : setId);
+    
+    const setData = { name: finalName, image: newSet.image, modules: newSet.selectedModules, totals: newSetTotals };
     await saveToDb('sets', setData, setId);
     setNewSet(initialSetState); setEditingSetId(null);
   };
@@ -383,7 +412,6 @@ export default function App() {
     // 1. KDV HESAPLAMASI (KDV Dahil fiyattan KDV tutarını içten ayırma)
     const vatRate = parseFloat(totalVATPercent) / 100;
     // Formül: KDV Tutarı = Satış Fiyatı - (Satış Fiyatı / (1 + KDV Oranı))
-    // Örnek: 120 TL'nin KDV'si (%20): 120 - (120 / 1.20) = 20 TL
     const vatCost = salePrice - (salePrice / (1 + vatRate));
     
     // KDV Hariç Satış Fiyatı (Gerçek Cironuz)
@@ -570,6 +598,7 @@ export default function App() {
 
       <main className="flex-1 overflow-y-auto p-8 bg-gray-50/50">
         
+        {}
         {/* Hammadde */}
         {activeTab === 'materials' && (
           <div className="space-y-6 max-w-5xl">
@@ -608,6 +637,7 @@ export default function App() {
           </div>
         )}
 
+        {}
         {/* Modüller */}
         {activeTab === 'modules' && (
           <div className="space-y-6">
@@ -665,6 +695,7 @@ export default function App() {
           </div>
         )}
 
+        {}
         {/* Kutular */}
         {activeTab === 'boxes' && (
           <div className="space-y-6">
@@ -761,6 +792,7 @@ export default function App() {
           </div>
         )}
 
+        {}
         {/* Komisyonlar */}
         {activeTab === 'commissions' && (
           <div className="space-y-6">
@@ -931,6 +963,7 @@ export default function App() {
           </div>
         )}
 
+        {}
         {/* Set Oluştur */}
         {activeTab === 'sets' && (
           <div className="space-y-6">
