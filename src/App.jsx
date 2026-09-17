@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Package, Plus, Trash2, Settings, Box, Percent, 
   Calculator, Info, AlertCircle, Image as ImageIcon, Layers, Shield,
-  Edit, Save, Upload, X, Truck, Target, CheckCircle, ChevronDown, ChevronUp, ShoppingBag, Truck as FastDelivery, Download, Loader2, LogOut, Lock, Mail, Key
+  Edit, Save, Upload, X, Truck, Target, CheckCircle, ChevronDown, ChevronUp, ShoppingBag, Truck as FastDelivery, Download, Loader2, LogOut, Lock, Mail, Key, ArrowUpDown
 } from 'lucide-react';
 
 import { initializeApp } from 'firebase/app';
@@ -65,6 +65,9 @@ export default function App() {
   const [safetyRules, setSafetyRules] = useState([]);
   const [margins, setMargins] = useState([]);
   const [sets, setSets] = useState([]);
+
+  // Sıralama State'i
+  const [setSortConfig, setSetSortConfig] = useState({ key: 'dateDesc' });
 
   // Firebase Auth Dinleyicisi
   useEffect(() => {
@@ -150,8 +153,6 @@ export default function App() {
        if(id) {
            await setDoc(doc(db, `${getBasePath()}/${collectionName}`, id.toString()), data);
        } else {
-           // Firestore will auto-generate a valid 20-char ID if we use doc(collection(...))
-           // However, to keep it simple and consistent with your structure, we'll use a reliable timestamp string.
            const newId = `doc_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
            await setDoc(doc(db, `${getBasePath()}/${collectionName}`, newId), data);
        }
@@ -244,10 +245,7 @@ export default function App() {
   const [newTax, setNewTax] = useState(initialTaxState);
   const [editingTaxId, setEditingTaxId] = useState(null);
   
-  // Sadece KDV olanların toplamı (Cirodan Düşülecek)
   const totalVATPercent = useMemo(() => taxes.filter(t => !t.isIncomeTax).reduce((sum, item) => sum + parseFloat(item.rate || 0), 0).toFixed(1), [taxes]);
-  
-  // Sadece Gelir Vergisi olanların toplamı (Kârdan Düşülecek)
   const totalIncomeTaxPercent = useMemo(() => taxes.filter(t => t.isIncomeTax).reduce((sum, item) => sum + parseFloat(item.rate || 0), 0).toFixed(1), [taxes]);
 
   const saveTax = async () => {
@@ -277,38 +275,47 @@ export default function App() {
   };
 
   // Setler
-  const initialSetState = { image: null, selectedModules: [] }; 
+  const initialSetState = { image: null, selectedModules: [], customSetNumber: '' }; 
   const [newSet, setNewSet] = useState(initialSetState);
   const [editingSetId, setEditingSetId] = useState(null);
   const [currentModuleSelection, setCurrentModuleSelection] = useState({ moduleId: '', qty: 1 });
 
-  // YENİ VE HATASIZ SKU OLUŞTURUCU (KATEGORİ İÇİNDE KULLANICININ EKLEME SIRASINI KORUR)
-  const generateSetName = (selectedMods, existingId) => {
+  // YENİ VE HATASIZ SKU OLUŞTURUCU 
+  const generateSetName = (selectedMods, setNumberInput) => {
     if (selectedMods.length === 0) return "S_XXX_FH_...";
     
-    // Güvenilir bir Set Numarası bul (Mevcut setId'den veya dizinin uzunluğundan)
-    // Random ID'lerin (doc_timestamp_random) uzunluk sorununu aşmak için "setNumber" hesaplıyoruz
+    // Kullanıcı özel numara girdiyse onu kullan, yoksa mevcudu koru veya yeni oluştur
     let setNumber = "001";
-    if (existingId && existingId.startsWith('SET_')) {
-        setNumber = existingId.replace('SET_', '').substring(0, 3).padStart(3, '0');
+    if (setNumberInput && setNumberInput.trim() !== '') {
+        // Kullanıcı girişini 3 haneli yap
+        setNumber = String(setNumberInput).padStart(3, '0');
+    } else if (editingSetId && editingSetId.startsWith('SET_')) {
+        // Düzenleme modundaysa mevcut numarayı çıkar
+        setNumber = editingSetId.replace('SET_', '');
     } else {
-        setNumber = String(sets.length + 1).padStart(3, '0');
+        // Yeni kayıt ise listeye bakarak sıradaki numarayı bul
+        // Listede eksik olan numaraları veya en büyük numarayı bulur
+        let maxNum = 0;
+        sets.forEach(s => {
+            if(s.id.startsWith('SET_')) {
+                const num = parseInt(s.id.replace('SET_', ''), 10);
+                if(!isNaN(num) && num > maxNum) maxNum = num;
+            }
+        });
+        setNumber = String(maxNum + 1).padStart(3, '0');
     }
 
     let nameParts = [`S_${setNumber}`, 'FH'];
     
-    // Modülleri kategori sırasına göre grupla ama aynı kategori içinde EKLEME SIRASINI bozma.
+    // Modülleri kategori sırasına göre grupla ve EKLEME SIRASINI bozma.
     CATEGORIES.forEach(cat => {
-      // 1. Sadece kullanıcının seçtiği array üzerinde filtreleme yapıyoruz. Sort yok.
       const modsInCat = selectedMods.filter(sm => {
          const mod = modules.find(m => m.id === sm.moduleId);
          return mod && mod.category === cat;
       });
 
-      // 2. Kategori eşleşenleri, eklenme sırasıyla SKU'ya ekle
       modsInCat.forEach(sm => {
          const mod = modules.find(m => m.id === sm.moduleId);
-         // "mod.code" içindeki tireleri (eğer varsa) alt çizgiye çevirerek SKU standardına uydur.
          const cleanCode = mod.code.replaceAll('-', '_');
          nameParts.push(`${cleanCode}-${sm.qty}`);
       });
@@ -342,12 +349,50 @@ export default function App() {
   const saveSet = async () => {
     if (newSet.selectedModules.length === 0) return;
     
-    // Set'ler için özel ID oluşturuyoruz ki numaralandırma düzgün çalışsın
-    const setId = editingSetId || `SET_${String(sets.length + 1).padStart(3, '0')}_${Date.now().toString().slice(-4)}`;
-    const finalName = generateSetName(newSet.selectedModules, editingSetId ? editingSetId : setId);
+    let setIdStr = "";
+    if(editingSetId) {
+        // Güncelleme yapılıyorsa ve kullanıcı numara girdiyse ID'yi değiştirmemiz lazım (Eski ID'yi silip yeni ID ile kaydedeceğiz)
+        if(newSet.customSetNumber && newSet.customSetNumber.trim() !== '') {
+            const num = String(newSet.customSetNumber).padStart(3, '0');
+            setIdStr = `SET_${num}`;
+            if(setIdStr !== editingSetId) {
+                // ID değiştiyse eskisini sil
+                 await deleteFromDb('sets', editingSetId);
+            }
+        } else {
+             setIdStr = editingSetId;
+        }
+    } else {
+         // Yeni set oluşturuluyor
+         let setNumber = "001";
+         if (newSet.customSetNumber && newSet.customSetNumber.trim() !== '') {
+             setNumber = String(newSet.customSetNumber).padStart(3, '0');
+         } else {
+            let maxNum = 0;
+            sets.forEach(s => {
+                if(s.id.startsWith('SET_')) {
+                    const num = parseInt(s.id.replace('SET_', ''), 10);
+                    if(!isNaN(num) && num > maxNum) maxNum = num;
+                }
+            });
+            setNumber = String(maxNum + 1).padStart(3, '0');
+         }
+         setIdStr = `SET_${setNumber}`;
+    }
     
-    const setData = { name: finalName, image: newSet.image, modules: newSet.selectedModules, totals: newSetTotals };
-    await saveToDb('sets', setData, setId);
+    // Set ismini tekrar generate et (Çünkü numara değişmiş olabilir)
+    const finalName = generateSetName(newSet.selectedModules, setIdStr.replace('SET_', ''));
+    
+    const setData = { 
+        name: finalName, 
+        image: newSet.image, 
+        modules: newSet.selectedModules, 
+        totals: newSetTotals,
+        createdAt: editingSetId ? sets.find(s=>s.id === editingSetId)?.createdAt || Date.now() : Date.now(),
+        updatedAt: Date.now()
+    };
+
+    await saveToDb('sets', setData, setIdStr);
     setNewSet(initialSetState); setEditingSetId(null);
   };
 
@@ -399,36 +444,28 @@ export default function App() {
     
     const totalBaseCost = baseCost + safetyCost;
     
-    // Kar Marjı Kuralı (Üretim maliyetine göre Kuralı buluyoruz)
+    // Kar Marjı Kuralı
     const margin = margins.find(m => prodCost >= parseFloat(m.minCost) && prodCost <= parseFloat(m.maxCost));
     const multiplier = margin ? parseFloat(margin.multiplier) : 1; 
     
-    // SADECE PLASTİK MALİYETİ ÜZERİNDEN KÂR (ÇARPAN) UYGULANIYOR
+    // SADECE PLASTİK MALİYETİ ÜZERİNDEN KÂR 
     const profitOnProduction = prodCost * multiplier; 
     
-    // Satış Fiyatı (KDV Dahil Hedef Fiyat): (Üretim x Çarpan) + Diğer Maliyetler
+    // Satış Fiyatı
     const salePrice = profitOnProduction + boxCost + shippingCost + packingCost + safetyCost;
 
-    // 1. KDV HESAPLAMASI (KDV Dahil fiyattan KDV tutarını içten ayırma)
     const vatRate = parseFloat(totalVATPercent) / 100;
-    // Formül: KDV Tutarı = Satış Fiyatı - (Satış Fiyatı / (1 + KDV Oranı))
     const vatCost = salePrice - (salePrice / (1 + vatRate));
-    
-    // KDV Hariç Satış Fiyatı (Gerçek Cironuz)
     const salePriceWithoutVAT = salePrice - vatCost;
 
-    // 2. KOMİSYON HESAPLAMASI (Komisyon genellikle KDV Dahil satış fiyatı üzerinden kesilir)
     const commRate = parseFloat(totalCommissionPercent) / 100;
     const totalCommCost = (salePrice * commRate) + parseFloat(totalFixedFee);
 
-    // 3. BRÜT KÂR HESAPLAMASI (Gerçek Ciro - Tüm Maliyetler - Komisyon)
     const grossProfit = salePriceWithoutVAT - totalBaseCost - totalCommCost;
 
-    // 4. GELİR / KURUMLAR VERGİSİ HESAPLAMASI (Sadece Brüt Kâr pozitifse kesilir)
     const incomeTaxRate = parseFloat(totalIncomeTaxPercent) / 100;
     const incomeTaxCost = grossProfit > 0 ? (grossProfit * incomeTaxRate) : 0;
 
-    // 5. NET KÂR
     const netProfit = grossProfit - incomeTaxCost;
     const profitMargin = salePrice > 0 ? (netProfit / salePrice) * 100 : 0;
 
@@ -440,7 +477,7 @@ export default function App() {
 
   const exportToExcel = () => {
     const headers = ["SKU / Set Kodu", "Satış Fiyatı (TL)", "Üretim Maliyeti (TL)", "Koli Maliyeti (TL)", "Kargo Maliyeti (TL)", "Ambalaj (TL)", "KDV (TL)", "Gelir Vergisi (TL)", "Komisyon (TL)", "Net Kar (TL)", "Kar Marjı (%)", "Koli Tipi", "Kargo Desi", "Set İçeriği"];
-    const rows = sets.map(set => {
+    const rows = sortedSets.map(set => {
       const data = calculateSalesData(set);
       const contentStr = set.modules.map(sm => {
          const mod = modules.find(m => m.id === sm.moduleId);
@@ -458,6 +495,42 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
   };
+
+  // Sıralanmış Setleri Döndüren Fonksiyon
+  const sortedSets = useMemo(() => {
+    let sortableItems = [...sets];
+    switch(setSortConfig.key) {
+        case 'nameAsc':
+            sortableItems.sort((a, b) => a.name.localeCompare(b.name));
+            break;
+        case 'nameDesc':
+            sortableItems.sort((a, b) => b.name.localeCompare(a.name));
+            break;
+        case 'dateAsc':
+            sortableItems.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+            break;
+        case 'dateDesc':
+            sortableItems.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            break;
+        case 'priceAsc':
+            sortableItems.sort((a, b) => calculateSalesData(a).salePrice - calculateSalesData(b).salePrice);
+            break;
+        case 'priceDesc':
+            sortableItems.sort((a, b) => calculateSalesData(b).salePrice - calculateSalesData(a).salePrice);
+            break;
+        case 'updatedDesc':
+             sortableItems.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+             break;
+        default:
+            // Varsayılan id'ye göre sırala (SET_001, SET_002)
+            sortableItems.sort((a, b) => {
+                const numA = parseInt(a.id.replace('SET_', '')) || 0;
+                const numB = parseInt(b.id.replace('SET_', '')) || 0;
+                return numA - numB;
+            });
+    }
+    return sortableItems;
+  }, [sets, setSortConfig, modules]);
 
   // Yüklenme Ekranı (Auth için)
   if (authLoading) {
@@ -538,7 +611,6 @@ export default function App() {
     );
   }
 
-  // Yüklenme Ekranı (Veritabanı için)
   if (!isDbReady) {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-900 text-emerald-400 flex-col gap-4">
@@ -598,7 +670,6 @@ export default function App() {
 
       <main className="flex-1 overflow-y-auto p-8 bg-gray-50/50">
         
-        {}
         {/* Hammadde */}
         {activeTab === 'materials' && (
           <div className="space-y-6 max-w-5xl">
@@ -637,7 +708,6 @@ export default function App() {
           </div>
         )}
 
-        {}
         {/* Modüller */}
         {activeTab === 'modules' && (
           <div className="space-y-6">
@@ -695,7 +765,6 @@ export default function App() {
           </div>
         )}
 
-        {}
         {/* Kutular */}
         {activeTab === 'boxes' && (
           <div className="space-y-6">
@@ -792,7 +861,6 @@ export default function App() {
           </div>
         )}
 
-        {}
         {/* Komisyonlar */}
         {activeTab === 'commissions' && (
           <div className="space-y-6">
@@ -963,13 +1031,15 @@ export default function App() {
           </div>
         )}
 
-        {}
         {/* Set Oluştur */}
         {activeTab === 'sets' && (
           <div className="space-y-6">
             <h2 className="text-xl font-semibold text-gray-800 flex items-center gap-2"><Settings className="text-emerald-600" /> Set Oluştur</h2>
              <div className={`p-6 rounded-xl shadow-sm border ${editingSetId ? 'bg-amber-50 border-amber-200' : 'bg-white border-gray-200'}`}>
-               <div className="flex justify-between items-center mb-6 border-b pb-2"><h3 className="font-semibold text-gray-800">{editingSetId ? 'Seti Düzenle' : 'Yeni Set Oluştur'}</h3>{editingSetId && <button onClick={() => {setEditingSetId(null); setNewSet(initialSetState);}} className="text-sm text-gray-500 hover:text-red-500 flex items-center gap-1"><X size={16}/> İptal</button>}</div>
+               <div className="flex justify-between items-center mb-6 border-b pb-2">
+                 <h3 className="font-semibold text-gray-800">{editingSetId ? 'Seti Düzenle' : 'Yeni Set Oluştur'}</h3>
+                 {editingSetId && <button onClick={() => {setEditingSetId(null); setNewSet(initialSetState);}} className="text-sm text-gray-500 hover:text-red-500 flex items-center gap-1"><X size={16}/> İptal</button>}
+               </div>
               <div className="flex flex-col md:flex-row gap-8">
                 <div className="w-full md:w-1/3 space-y-6">
                   
@@ -987,7 +1057,22 @@ export default function App() {
                   </div>
                 </div>
                 <div className="w-full md:w-2/3 flex flex-col">
-                  <div className="bg-slate-900 text-white p-4 rounded-t-lg"><p className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Otomatik Set Kodu</p><p className="font-mono text-lg text-emerald-400 break-all">{generateSetName(newSet.selectedModules, editingSetId)}</p></div>
+                  <div className="bg-slate-900 text-white p-4 rounded-t-lg flex justify-between items-center">
+                      <div>
+                        <p className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Otomatik Set Kodu</p>
+                        <p className="font-mono text-lg text-emerald-400 break-all">{generateSetName(newSet.selectedModules, newSet.customSetNumber)}</p>
+                      </div>
+                      <div className="bg-slate-800 p-2 rounded flex items-center gap-2">
+                         <span className="text-xs text-slate-400">Özel Set No:</span>
+                         <input 
+                            type="number" 
+                            placeholder="Otomatik"
+                            value={newSet.customSetNumber}
+                            onChange={(e) => setNewSet({...newSet, customSetNumber: e.target.value})}
+                            className="w-20 p-1 text-sm bg-slate-900 border border-slate-700 rounded text-white outline-none focus:border-emerald-500"
+                         />
+                      </div>
+                  </div>
                   <div className="flex-1 bg-white border-x border-gray-200 p-4 overflow-y-auto min-h-[150px]">
                      {newSet.selectedModules.map((sm, idx) => {
                           const mod = modules.find(m => m.id === sm.moduleId);
@@ -995,16 +1080,47 @@ export default function App() {
                           return (<div key={idx} className="flex justify-between items-center bg-gray-50 p-2 rounded border border-gray-100 mb-2"><div className="flex items-center gap-3"><span className="text-sm font-medium text-gray-700">{mod.name}</span><span className="text-xs text-gray-400">({mod.width}x{mod.depth}x{mod.height}cm)</span></div><div className="flex items-center gap-4"><span className="text-sm font-bold text-gray-800 bg-white border px-2 py-1 rounded shadow-sm">x{sm.qty}</span><button onClick={() => setNewSet({...newSet, selectedModules: newSet.selectedModules.filter(m=>m.moduleId !== sm.moduleId)})} className="text-red-400 hover:text-red-600"><Trash2 size={16}/></button></div></div>);
                       })}
                   </div>
-                  <div className="bg-gray-50 border border-gray-200 p-4 rounded-b-lg flex justify-between items-center"><div className="flex gap-6 text-sm"><div><span className="text-gray-500 block text-xs">Top. PETG</span><span className="font-semibold">{newSetTotals.petg}g</span></div><div><span className="text-gray-500 block text-xs">Top. Destek</span><span className="font-semibold">{newSetTotals.support}g</span></div><div><span className="text-gray-500 block text-xs">Üretim Maliyeti</span><span className="font-bold text-emerald-700">{newSetTotals.cost} ₺</span></div></div><button onClick={saveSet} className={`px-6 py-2 rounded font-medium text-white shadow-sm flex items-center gap-2 ${editingSetId ? 'bg-amber-500 hover:bg-amber-600' : 'bg-slate-800 hover:bg-slate-900'}`}>{editingSetId ? 'Güncelle' : 'Seti Kaydet'}</button></div>
+                  <div className="bg-gray-50 border border-gray-200 p-4 rounded-b-lg flex justify-between items-center">
+                      <div className="flex gap-6 text-sm">
+                          <div><span className="text-gray-500 block text-xs">Top. PETG</span><span className="font-semibold">{newSetTotals.petg}g</span></div>
+                          <div><span className="text-gray-500 block text-xs">Top. Destek</span><span className="font-semibold">{newSetTotals.support}g</span></div>
+                          <div><span className="text-gray-500 block text-xs">Üretim Maliyeti</span><span className="font-bold text-emerald-700">{newSetTotals.cost} ₺</span></div>
+                      </div>
+                      <button 
+                        onClick={saveSet} 
+                        disabled={newSet.selectedModules.length === 0}
+                        className={`px-6 py-2 rounded font-medium text-white shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${editingSetId ? 'bg-amber-500 hover:bg-amber-600' : 'bg-slate-800 hover:bg-slate-900'}`}
+                      >
+                          {editingSetId ? 'Güncelle' : 'Seti Kaydet'}
+                      </button>
+                   </div>
                 </div>
               </div>
             </div>
             
             <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mt-6">
-               <div className="p-4 border-b border-gray-200 bg-gray-50"><h3 className="font-semibold text-gray-700">Kayıtlı Setler ({sets.length})</h3></div>
+               <div className="p-4 border-b border-gray-200 bg-gray-50 flex justify-between items-center">
+                   <h3 className="font-semibold text-gray-700">Kayıtlı Setler ({sets.length})</h3>
+                   <div className="flex items-center gap-2 text-sm">
+                       <span className="text-gray-500 flex items-center gap-1"><ArrowUpDown size={14}/> Sırala:</span>
+                       <select 
+                         value={setSortConfig.key} 
+                         onChange={(e) => setSetSortConfig({key: e.target.value})}
+                         className="p-1.5 border border-gray-300 rounded bg-white text-gray-700 outline-none"
+                       >
+                           <option value="idAsc">Set Numarası (Sıralı)</option>
+                           <option value="nameAsc">İsim (A-Z)</option>
+                           <option value="dateDesc">Eklenme (En Yeni)</option>
+                           <option value="dateAsc">Eklenme (En Eski)</option>
+                           <option value="updatedDesc">Son Değişiklik</option>
+                           <option value="priceDesc">Fiyat (En Yüksek)</option>
+                           <option value="priceAsc">Fiyat (En Düşük)</option>
+                       </select>
+                   </div>
+               </div>
                  <table className="w-full text-left text-sm">
                     <tbody className="divide-y divide-gray-100">
-                        {sets.map(set => (
+                        {sortedSets.map(set => (
                            <tr key={set.id} className="hover:bg-gray-50">
                              <td className="p-4 w-16">
                                {set.image ? <img src={set.image} alt="" className="w-12 h-12 rounded object-cover border" /> : <div className="w-12 h-12 bg-gray-100 rounded border flex items-center justify-center"><ImageIcon size={16} className="text-gray-400"/></div>}
@@ -1015,7 +1131,19 @@ export default function App() {
                              </td>
                              <td className="p-4 font-bold text-gray-800 text-right">{set.totals.cost} ₺</td>
                              <td className="p-4 text-center">
-                               <button onClick={() => {setNewSet({image:set.image, selectedModules:set.modules}); setEditingSetId(set.id);}} className="text-gray-400 hover:text-amber-500 p-2"><Edit size={16}/></button>
+                               <button 
+                                 onClick={() => {
+                                    setNewSet({
+                                        image:set.image, 
+                                        selectedModules:set.modules,
+                                        customSetNumber: set.id.replace('SET_', '') // Numarayı inputa al
+                                    }); 
+                                    setEditingSetId(set.id);
+                                 }} 
+                                 className="text-gray-400 hover:text-amber-500 p-2"
+                               >
+                                   <Edit size={16}/>
+                               </button>
                                <button onClick={() => deleteFromDb('sets', set.id)} className="text-gray-400 hover:text-red-500 p-2"><Trash2 size={16}/></button>
                              </td>
                            </tr>
@@ -1033,20 +1161,39 @@ export default function App() {
                <h2 className="text-xl font-semibold text-gray-800 flex items-center gap-2">
                  <ShoppingBag className="text-emerald-600" /> Dinamik Satış & Fiyatlandırma
                </h2>
-               <button 
-                 onClick={exportToExcel} 
-                 disabled={sets.length === 0}
-                 className="flex items-center gap-2 bg-emerald-700 hover:bg-emerald-800 disabled:bg-gray-400 text-white px-5 py-2.5 rounded-lg font-medium shadow-sm transition-colors text-sm"
-               >
-                 <Download size={18} /> Excel'e Aktar (İkas Uyumlu)
-               </button>
+               
+               <div className="flex items-center gap-4 w-full md:w-auto">
+                   <div className="flex items-center gap-2 text-sm bg-white border border-gray-200 px-3 py-2.5 rounded-lg shadow-sm">
+                       <span className="text-gray-500 flex items-center gap-1"><ArrowUpDown size={14}/></span>
+                       <select 
+                         value={setSortConfig.key} 
+                         onChange={(e) => setSetSortConfig({key: e.target.value})}
+                         className="bg-transparent text-gray-700 outline-none font-medium cursor-pointer"
+                       >
+                           <option value="idAsc">Set Numarası (Sıralı)</option>
+                           <option value="nameAsc">İsim (A-Z)</option>
+                           <option value="dateDesc">En Son Eklenenler</option>
+                           <option value="updatedDesc">Son Değiştirilenler</option>
+                           <option value="priceDesc">Fiyata Göre (Azalan)</option>
+                           <option value="priceAsc">Fiyata Göre (Artan)</option>
+                       </select>
+                   </div>
+                   
+                   <button 
+                     onClick={exportToExcel} 
+                     disabled={sets.length === 0}
+                     className="flex items-center gap-2 bg-emerald-700 hover:bg-emerald-800 disabled:bg-gray-400 text-white px-5 py-2.5 rounded-lg font-medium shadow-sm transition-colors text-sm"
+                   >
+                     <Download size={18} /> Excel'e Aktar
+                   </button>
+               </div>
             </div>
             
             <div className="bg-blue-50 text-blue-700 p-4 rounded-lg text-sm flex gap-3"><Info size={20} className="flex-shrink-0"/> <p>Bu sayfada setlerinizin koli seçimi, paket malzemeleri, vergi ve komisyon giderleri otomatik olarak hesaplanarak net kârlılık oranları gösterilir.</p></div>
 
             <div className="space-y-3">
               {sets.length === 0 && <div className="text-center p-12 text-gray-400 bg-white rounded-xl border border-dashed border-gray-300">Henüz "Set Oluştur" sayfasından bir ürün oluşturmadınız.</div>}
-              {sets.map(set => {
+              {sortedSets.map(set => {
                  const data = calculateSalesData(set);
                  const isExpanded = expandedSetId === set.id;
                  
