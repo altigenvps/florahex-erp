@@ -278,9 +278,15 @@ export default function App() {
     if (selectedMods.length === 0) return "S_XXX_FH_...";
     const setNumber = existingId ? existingId.substring(existingId.length - 3) : String(sets.length + 1).padStart(3, '0');
     let nameParts = [`S_${setNumber}`, 'FH'];
+    
+    // selectedMods (kullanıcının eklediği sıra) dizisini kullanarak ilerliyoruz.
     CATEGORIES.forEach(cat => {
-      const modsInCat = selectedMods.map(sm => ({ qty: sm.qty, mod: modules.find(m => m.id === sm.moduleId) }))
-        .filter(item => item.mod && item.mod.category === cat).sort((a, b) => a.mod.code.localeCompare(b.mod.code)); 
+      // SADECE kategori eşleşmesini filtreliyoruz, SORT YAPMIYORUZ!
+      const modsInCat = selectedMods
+        .map(sm => ({ qty: sm.qty, mod: modules.find(m => m.id === sm.moduleId) }))
+        .filter(item => item.mod && item.mod.category === cat);
+        
+      // Eklenme sırasına göre koda ekliyoruz.
       modsInCat.forEach(item => nameParts.push(`${item.mod.code.replace(/-/g, '_')}-${item.qty}`));
     });
     return nameParts.join('_');
