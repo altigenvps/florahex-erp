@@ -13,7 +13,7 @@ import {
   createUserWithEmailAndPassword, 
   signOut 
 } from 'firebase/auth';
-import { getFirestore, collection, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { getFirestore, collection, onSnapshot, doc, setDoc, deleteDoc, writeBatch } from 'firebase/firestore';
 
 // Kullanıcının kendi Firebase Config bilgileri
 const userFirebaseConfig = {
@@ -31,6 +31,9 @@ const appId = 'florahex-erp';
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+
+// Chunk Array Helper (Batch kaydetme limiti için)
+const chunkArray = (arr, size) => Array.from({ length: Math.ceil(arr.length / size) }, (v, i) => arr.slice(i * size, i * size + size));
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('materials');
@@ -68,6 +71,12 @@ export default function App() {
 
   // Sıralama State'i
   const [setSortConfig, setSetSortConfig] = useState({ key: 'dateDesc' });
+
+  // Toplu Yükleme (Import) State'leri
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importLogs, setImportLogs] = useState([]);
+  const [isImporting, setIsImporting] = useState(false);
 
   // Firebase Auth Dinleyicisi
   useEffect(() => {
@@ -284,17 +293,12 @@ export default function App() {
   const generateSetName = (selectedMods, setNumberInput) => {
     if (selectedMods.length === 0) return "S_XXX_FH_...";
     
-    // Kullanıcı özel numara girdiyse onu kullan, yoksa mevcudu koru veya yeni oluştur
     let setNumber = "001";
     if (setNumberInput && setNumberInput.trim() !== '') {
-        // Kullanıcı girişini 3 haneli yap
         setNumber = String(setNumberInput).padStart(3, '0');
     } else if (editingSetId && editingSetId.startsWith('SET_')) {
-        // Düzenleme modundaysa mevcut numarayı çıkar
         setNumber = editingSetId.replace('SET_', '');
     } else {
-        // Yeni kayıt ise listeye bakarak sıradaki numarayı bul
-        // Listede eksik olan numaraları veya en büyük numarayı bulur
         let maxNum = 0;
         sets.forEach(s => {
             if(s.id.startsWith('SET_')) {
@@ -307,7 +311,6 @@ export default function App() {
 
     let nameParts = [`S_${setNumber}`, 'FH'];
     
-    // Modülleri kategori sırasına göre grupla ve EKLEME SIRASINI bozma.
     CATEGORIES.forEach(cat => {
       const modsInCat = selectedMods.filter(sm => {
          const mod = modules.find(m => m.id === sm.moduleId);
@@ -351,19 +354,16 @@ export default function App() {
     
     let setIdStr = "";
     if(editingSetId) {
-        // Güncelleme yapılıyorsa ve kullanıcı numara girdiyse ID'yi değiştirmemiz lazım (Eski ID'yi silip yeni ID ile kaydedeceğiz)
         if(newSet.customSetNumber && newSet.customSetNumber.trim() !== '') {
             const num = String(newSet.customSetNumber).padStart(3, '0');
             setIdStr = `SET_${num}`;
             if(setIdStr !== editingSetId) {
-                // ID değiştiyse eskisini sil
                  await deleteFromDb('sets', editingSetId);
             }
         } else {
              setIdStr = editingSetId;
         }
     } else {
-         // Yeni set oluşturuluyor
          let setNumber = "001";
          if (newSet.customSetNumber && newSet.customSetNumber.trim() !== '') {
              setNumber = String(newSet.customSetNumber).padStart(3, '0');
@@ -380,7 +380,6 @@ export default function App() {
          setIdStr = `SET_${setNumber}`;
     }
     
-    // Set ismini tekrar generate et (Çünkü numara değişmiş olabilir)
     const finalName = generateSetName(newSet.selectedModules, setIdStr.replace('SET_', ''));
     
     const setData = { 
@@ -395,6 +394,148 @@ export default function App() {
     await saveToDb('sets', setData, setIdStr);
     setNewSet(initialSetState); setEditingSetId(null);
   };
+
+  // --- EXCEL IMPORT (TOPLU YÜKLEME) FONKSİYONU ---
+  const handleImport = async () => {
+    if(!importText.trim()) return;
+    setIsImporting(true);
+    setImportLogs([]);
+    
+    // Satırlara ayır ve boş olanları temizle
+    const lines = importText.split('\n').map(l => l.trim()).filter(l => l);
+    let errorCount = 0;
+    const newLogs = [];
+    const validSets = [];
+
+    for (const line of lines) {
+        // Excel başlığını (SET) veya hatalı satırları atla
+        if (line.toUpperCase() === 'SET' || !line.toUpperCase().startsWith('S_')) {
+            newLogs.push(`ℹ️ Atlandı (Format dışı satır): ${line}`);
+            continue;
+        }
+
+        // SKU numarasını ve modül kısmını Regex ile ayır
+        // Örn: S_001_FH_Tx1_01-1_P50-1
+        const match = line.match(/^S_(\d+)_FH_(.*)$/i);
+        if (!match) {
+            newLogs.push(`❌ Hata (Geçersiz SKU yapısı): ${line}`);
+            errorCount++;
+            continue;
+        }
+
+        const setNumber = match[1]; // 001
+        const modulesPart = match[2]; // Tx1_01-1_P50-1
+
+        // Modülleri birbirlerinden ayır (Akıllı ayırıcı algoritma)
+        const parts = modulesPart.split('_');
+        const parsedModules = [];
+        let currentCode = "";
+        
+        for (const part of parts) {
+            if (currentCode) currentCode += "_" + part;
+            else currentCode = part;
+            
+            // Eğer parça "-" içeriyorsa (Örn: -1, -2 adet) bu bir modül bloğunun sonudur.
+            if (currentCode.includes('-')) {
+                parsedModules.push(currentCode);
+                currentCode = "";
+            }
+        }
+
+        const selectedModules = [];
+        let hasError = false;
+
+        // Her bir modül bloğunu incele (Örn: "Tx1_01-1")
+        for(const pm of parsedModules) {
+            const [rawCode, qtyStr] = pm.split('-'); // rawCode: Tx1_01, qtyStr: 1
+            const qty = parseInt(qtyStr, 10);
+            
+            if(isNaN(qty) || !rawCode) {
+                newLogs.push(`❌ Hata (Hatalı modül adet formatı '${pm}'): ${line}`);
+                hasError = true;
+                break;
+            }
+
+            // Gelen kodu veritabanındaki formatla eşleştir
+            const normalizedParsedCode = rawCode.toUpperCase().replaceAll('-', '_');
+            const foundModule = modules.find(m => m.code.toUpperCase().replaceAll('-', '_') === normalizedParsedCode);
+
+            if (!foundModule) {
+                newLogs.push(`❌ Hata (Veritabanında '${rawCode}' modülü bulunamadı! Lütfen ekleyin.): ${line}`);
+                hasError = true;
+                break;
+            }
+
+            selectedModules.push({
+                moduleId: foundModule.id,
+                qty: qty
+            });
+        }
+
+        // Eğer modüllerden birinde hata çıktıysa bu seti kaydetmeden atla
+        if (hasError) {
+            errorCount++;
+            continue; 
+        }
+
+        // Toplam Maliyetleri Hesapla
+        let petg = 0, support = 0, cost = 0;
+        selectedModules.forEach(sm => {
+          const mod = modules.find(m => m.id === sm.moduleId);
+          if (mod) {
+            petg += mod.petg * sm.qty; 
+            support += mod.support * sm.qty;
+            cost += parseFloat(calculateModuleCost(mod.petg, mod.support)) * sm.qty;
+          }
+        });
+        const totals = { petg, support, cost: cost.toFixed(2) };
+
+        // Firebase için Datayı Hazırla
+        const setId = `SET_${setNumber}`;
+        const setData = { 
+            name: line, // Excel'deki ismi birebir koruyoruz
+            image: null, 
+            modules: selectedModules, 
+            totals: totals,
+            createdAt: Date.now(),
+            updatedAt: Date.now()
+        };
+
+        validSets.push({ id: setId, data: setData, line: line });
+    }
+
+    // Toplu Kayıt İşlemi (Batch)
+    if (validSets.length > 0) {
+        newLogs.push(`⏳ ${validSets.length} adet geçerli set bulundu, veritabanına yazılıyor...`);
+        setImportLogs([...newLogs]); // Logları ekranda anlık göster
+        
+        // Firebase Batch limiti 500'dür. Önlem olarak 400'erli gruplara bölelim.
+        const chunks = chunkArray(validSets, 400); 
+        let totalSaved = 0;
+        try {
+            for (const chunk of chunks) {
+                const batch = writeBatch(db);
+                for (const item of chunk) {
+                    const docRef = doc(db, `${getBasePath()}/sets`, item.id);
+                    batch.set(docRef, item.data);
+                }
+                await batch.commit();
+                totalSaved += chunk.length;
+            }
+            newLogs.push(`✅ BAŞARILI: ${totalSaved} adet set veritabanına başarıyla kaydedildi! Kapatabilirsiniz.`);
+        } catch (e) {
+            newLogs.push(`🚨 KRİTİK HATA: Veritabanına yazılırken sorun oluştu. (${e.message})`);
+        }
+    } else {
+        newLogs.push(`⚠️ Eklenecek hiçbir geçerli set bulunamadı. Hataları kontrol edip sütunu doğru kopyaladığınızdan emin olun.`);
+    }
+
+    setImportLogs(newLogs);
+    setIsImporting(false);
+    // İçeriği başarılıysa sıfırla (isteğe bağlı)
+    if (errorCount === 0 && validSets.length > 0) setImportText(""); 
+  };
+  // --- EXCEL IMPORT SONU ---
 
   const [expandedSetId, setExpandedSetId] = useState(null);
 
@@ -522,7 +663,6 @@ export default function App() {
              sortableItems.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
              break;
         default:
-            // Varsayılan id'ye göre sırala (SET_001, SET_002)
             sortableItems.sort((a, b) => {
                 const numA = parseInt(a.id.replace('SET_', '')) || 0;
                 const numB = parseInt(b.id.replace('SET_', '')) || 0;
@@ -1034,7 +1174,63 @@ export default function App() {
         {/* Set Oluştur */}
         {activeTab === 'sets' && (
           <div className="space-y-6">
-            <h2 className="text-xl font-semibold text-gray-800 flex items-center gap-2"><Settings className="text-emerald-600" /> Set Oluştur</h2>
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+               <h2 className="text-xl font-semibold text-gray-800 flex items-center gap-2"><Settings className="text-emerald-600" /> Set Oluştur</h2>
+               <button onClick={() => setShowImportModal(true)} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium shadow-sm transition-colors"><Upload size={18}/> Excel'den Toplu Yükle (Import)</button>
+            </div>
+
+            {/* IMPORT MODAL */}
+            {showImportModal && (
+               <div className="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+                 <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl flex flex-col max-h-[90vh] overflow-hidden border border-slate-200">
+                   <div className="p-5 border-b border-gray-100 flex justify-between items-center bg-slate-50">
+                     <h3 className="font-bold text-lg text-gray-800 flex items-center gap-2"><Upload className="text-blue-600"/> Excel'den Toplu Set Yükleme Sihirbazı</h3>
+                     <button onClick={() => setShowImportModal(false)} className="text-gray-400 hover:text-red-500 transition-colors p-1"><X size={20}/></button>
+                   </div>
+                   
+                   <div className="p-6 overflow-y-auto flex-1 bg-white">
+                      <div className="bg-blue-50 border border-blue-100 text-blue-800 p-4 rounded-lg text-sm mb-6 flex gap-3">
+                          <Info className="flex-shrink-0 text-blue-600" size={24} />
+                          <div>
+                            <p className="font-bold mb-1 text-base">Nasıl Yüklenir?</p>
+                            <p className="opacity-90 leading-relaxed">Excel dosyanızdaki <strong>SADECE Set Adı (SKU) sütununu</strong> (S_ ile başlayan isimleri) tamamen seçip kopyalayın ve aşağıdaki alana yapıştırın. Sistem o isimlerin içindeki matematiği çözecek, mevcut modüllerinizle eşleştirecek ve tüm maliyetleri hesaplayıp 300 seti saniyeler içinde veritabanına ekleyecektir.</p>
+                          </div>
+                      </div>
+
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Excel'den Kopyalanan Sütunu Buraya Yapıştırın (Ctrl+V):</label>
+                      <textarea 
+                         className="w-full h-56 p-4 border border-gray-300 rounded-lg text-sm font-mono whitespace-pre outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-500/10 transition-all bg-slate-50"
+                         placeholder="S_001_FH_Tx1_01-1_P50-1&#10;S_002_FH_Tx1_01-1_P100-1&#10;S_003_FH_Tx1_01-1_P150-1&#10;..."
+                         value={importText}
+                         onChange={(e) => setImportText(e.target.value)}
+                         disabled={isImporting}
+                      />
+
+                      {importLogs.length > 0 && (
+                          <div className="mt-6">
+                              <h4 className="text-sm font-bold text-slate-700 mb-2">İşlem Kayıtları (Loglar):</h4>
+                              <div className="bg-slate-900 rounded-lg p-4 h-48 overflow-y-auto font-mono text-[13px] text-slate-300 space-y-1.5 shadow-inner">
+                                  {importLogs.map((log, i) => (
+                                      <div key={i} className={`${log.startsWith('✅') ? 'text-emerald-400 font-bold' : log.startsWith('❌') || log.startsWith('🚨') ? 'text-red-400' : 'text-slate-400'}`}>
+                                          {log}
+                                      </div>
+                                  ))}
+                              </div>
+                          </div>
+                      )}
+                   </div>
+
+                   <div className="p-5 border-t border-gray-100 bg-slate-50 flex justify-end gap-3">
+                      <button onClick={() => setShowImportModal(false)} disabled={isImporting} className="px-5 py-2.5 text-sm font-medium text-slate-600 hover:bg-slate-200 rounded-lg transition-colors">Kapat</button>
+                      <button onClick={handleImport} disabled={isImporting || !importText.trim()} className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 disabled:cursor-not-allowed text-white text-sm font-bold rounded-lg shadow-md flex items-center gap-2 transition-all active:scale-95">
+                         {isImporting ? <Loader2 size={18} className="animate-spin"/> : <Upload size={18}/>}
+                         {isImporting ? 'Setler Analiz Ediliyor & Ekleniyor...' : 'Kodu Çöz ve İçe Aktar'}
+                      </button>
+                   </div>
+                 </div>
+               </div>
+            )}
+
              <div className={`p-6 rounded-xl shadow-sm border ${editingSetId ? 'bg-amber-50 border-amber-200' : 'bg-white border-gray-200'}`}>
                <div className="flex justify-between items-center mb-6 border-b pb-2">
                  <h3 className="font-semibold text-gray-800">{editingSetId ? 'Seti Düzenle' : 'Yeni Set Oluştur'}</h3>
@@ -1062,14 +1258,14 @@ export default function App() {
                         <p className="text-xs text-slate-400 mb-1 uppercase tracking-wider">Otomatik Set Kodu</p>
                         <p className="font-mono text-lg text-emerald-400 break-all">{generateSetName(newSet.selectedModules, newSet.customSetNumber)}</p>
                       </div>
-                      <div className="bg-slate-800 p-2 rounded flex items-center gap-2">
-                         <span className="text-xs text-slate-400">Özel Set No:</span>
+                      <div className="bg-slate-800 p-2 rounded flex items-center gap-2 border border-slate-700 focus-within:border-emerald-500 transition-colors">
+                         <span className="text-xs text-slate-400 ml-1">Özel Set No:</span>
                          <input 
                             type="number" 
-                            placeholder="Otomatik"
+                            placeholder="Oto"
                             value={newSet.customSetNumber}
                             onChange={(e) => setNewSet({...newSet, customSetNumber: e.target.value})}
-                            className="w-20 p-1 text-sm bg-slate-900 border border-slate-700 rounded text-white outline-none focus:border-emerald-500"
+                            className="w-16 p-1 text-center font-bold text-emerald-400 bg-transparent outline-none"
                          />
                       </div>
                   </div>
@@ -1101,12 +1297,12 @@ export default function App() {
             <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mt-6">
                <div className="p-4 border-b border-gray-200 bg-gray-50 flex justify-between items-center">
                    <h3 className="font-semibold text-gray-700">Kayıtlı Setler ({sets.length})</h3>
-                   <div className="flex items-center gap-2 text-sm">
+                   <div className="flex items-center gap-2 text-sm bg-white border border-gray-300 px-3 py-1.5 rounded-lg shadow-sm">
                        <span className="text-gray-500 flex items-center gap-1"><ArrowUpDown size={14}/> Sırala:</span>
                        <select 
                          value={setSortConfig.key} 
                          onChange={(e) => setSetSortConfig({key: e.target.value})}
-                         className="p-1.5 border border-gray-300 rounded bg-white text-gray-700 outline-none"
+                         className="bg-transparent text-gray-700 outline-none font-medium cursor-pointer"
                        >
                            <option value="idAsc">Set Numarası (Sıralı)</option>
                            <option value="nameAsc">İsim (A-Z)</option>
@@ -1136,7 +1332,7 @@ export default function App() {
                                     setNewSet({
                                         image:set.image, 
                                         selectedModules:set.modules,
-                                        customSetNumber: set.id.replace('SET_', '') // Numarayı inputa al
+                                        customSetNumber: set.id.replace('SET_', '')
                                     }); 
                                     setEditingSetId(set.id);
                                  }} 
